@@ -1,0 +1,27 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# data, indexes and stores are never committed
+/data/*
+!/data/README.md
+/.nutribuddy/
+/reports/
+*.db
+*.sqlite
+*.sqlite3
+*.npy
+/models/
+/artifacts/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
