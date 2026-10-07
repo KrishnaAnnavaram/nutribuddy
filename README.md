@@ -109,7 +109,7 @@ nutribuddy gives each of these questions its own component. A chat model is opti
 | Providers | Chat model: offline or any OpenAI-compatible endpoint (Ollama, vLLM, OpenAI). Embedder: hashing or sentence-transformers |
 | Offline mode | All commands. The offline model and the hashing embedder need no download |
 | Safety | Red flags go to urgent care. SQL uses bound parameters only. All model text is plain text |
-| Tests | **72** unit tests (`pytest`) pass and **1** skips in CI (the FastAPI test) |
+| Tests | **73** unit tests (`pytest`). In CI, 72 pass and 1 skips because the `api` extra is not installed |
 
 ```mermaid
 flowchart LR
@@ -467,7 +467,7 @@ Credentials are only in a local `.env` file. Git ignores this file. Do not print
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **72 passed, 1 skipped** (the FastAPI test skips if FastAPI is not installed. With FastAPI: 73 passed) | `pytest -q` |
+| Unit tests | **72 passed, 1 skipped** in CI, because the `api` extra is not installed. With the `api` extra: 73 passed | `pytest -q` |
 | Retrieval, 18 synthetic questions | recall@4 = **1.000**, MRR = **1.000** | `nutribuddy eval` after `nutribuddy demo` |
 | Screening, 60 synthetic items, offline model | accuracy **0.783** (95% CI 0.664 to 0.869), macro-F1 **0.776** | same |
 | Screening, keyword baseline | accuracy **0.850** (95% CI 0.739 to 0.919), macro-F1 **0.853** | same |
