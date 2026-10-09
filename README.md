@@ -74,6 +74,7 @@ This README is the **one location that explains all of nutribuddy**. It gives th
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one request](#42-the-life-cycle-of-one-request)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Ingestion and the index](#5-ingestion-and-the-index)
 6. 🟢 [Symptom screening](#6-symptom-screening)
 7. 🟣 [The diet plan and follow-up questions](#7-the-diet-plan-and-follow-up-questions)
@@ -145,6 +146,66 @@ flowchart LR
 | CLI | `src/nutribuddy/cli.py` | The `nutribuddy` command |
 | API | `src/nutribuddy/api.py` | Optional FastAPI app and a small web page |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry points"]
+        CLI["cli.py<br/>nutribuddy command"]
+        API["api.py<br/>FastAPI app, extra api"]
+    end
+    subgraph INGEST["Ingestion"]
+        ING["ingest.py<br/>build_index, load_food_folders"]
+        DOC["documents.py<br/>load_registry, read_pages"]
+        CHK["chunker.py<br/>chunk_pages"]
+        EMB["embeddings.py<br/>build_embedder"]
+        SYN["synthetic.py<br/>write_all"]
+    end
+    subgraph SERVICE["Service"]
+        SVC["service.py<br/>NutriBuddy"]
+        SCR["screening.py<br/>Screener"]
+        PLN["planner.py<br/>Planner"]
+        SAF["safety.py<br/>clean_input, red_flags"]
+        SES["sessions.py<br/>SessionStore"]
+    end
+    subgraph SHARED["Shared parts"]
+        IDX["index.py<br/>SearchIndex"]
+        FDB["fooddb.py<br/>food store"]
+        LLM["llm.py<br/>chat models"]
+        SCH["schemas.py<br/>complete_structured"]
+        PRM["prompts.py<br/>messages"]
+        CON["conditions.py<br/>label parser"]
+    end
+    EVA["evaluation.py<br/>run_all"]
+    REN["render.py<br/>plan_to_text, to_html"]
+    CLI --> ING
+    CLI --> SYN
+    CLI --> SVC
+    CLI --> EVA
+    CLI --> REN
+    API --> SVC
+    API --> REN
+    ING --> DOC
+    ING --> CHK
+    ING --> EMB
+    ING --> IDX
+    ING --> FDB
+    SVC --> SCR
+    SVC --> PLN
+    SVC --> SAF
+    SVC --> SES
+    SVC --> IDX
+    SVC --> LLM
+    SCR --> SCH
+    SCR --> PRM
+    SCR --> CON
+    PLN --> SCH
+    PLN --> PRM
+    PLN --> FDB
+    SCH --> LLM
+    EVA --> SVC
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -194,6 +255,23 @@ The screening status names a possible condition to discuss with a clinician. Red
 ### 3.5 Structured output with bounded retries
 `schemas.complete_structured` extracts the first JSON object, validates it with pydantic and retries with the error, up to `NUTRIBUDDY_LLM_MAX_ATTEMPTS`. A refusal stops the retries. Each failure goes to the log, not to a silent `except`.
 
+```mermaid
+flowchart TD
+    IN[/"messages and a pydantic schema<br/>ScreenReply or DietPlanReply"/] --> CALL["model.complete<br/>json_mode"]
+    CALL --> LE{"LLMError?"}
+    LE -- "yes" --> LOG1["Log a warning,<br/>record the error"]
+    LE -- "no" --> EX["extract_json_object<br/>first JSON object, fences removed"]
+    EX --> REF{"Only the key error?"}
+    REF -- "yes" --> MR[/"ModelRefusal<br/>no retry"/]
+    REF -- "no" --> VAL{"Schema validates?"}
+    VAL -- "yes" --> OK[/"StructuredResult<br/>value and attempts"/]
+    VAL -- "no" --> FB["Log, then add the reply and<br/>the error to the messages"]
+    LOG1 --> MORE{"Attempts left?<br/>NUTRIBUDDY_LLM_MAX_ATTEMPTS"}
+    FB --> MORE
+    MORE -- "yes" --> CALL
+    MORE -- "no" --> SOE[/"StructuredOutputError<br/>with all errors"/]
+```
+
 ### 3.6 Expensive objects are built once
 `NutriBuddy.from_settings` builds the embedder, the index, the chat model and the stores one time. A request writes no file in the working folder. The session store keeps the history on the server.
 
@@ -207,22 +285,58 @@ The core needs `numpy`, `pydantic` and `httpx`. PDF reading, sentence-transforme
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    REG["sources.json"] --> LOAD["load pages"] --> CH["chunk with overlap"] --> EMB["embed"] --> IDX["index + manifest"]
-    CSV["FoodData Central CSV"] --> UPS["idempotent upsert"] --> FS["food store"]
-    SYM["symptom text"] --> CLEAN["clean input"] --> RF{"red flag?"}
-    RF -->|"yes"| URG["status urgent"]
-    RF -->|"no"| SR["retrieve disease passages"] --> SCM["chat model: JSON label"] --> LP["label parser"] --> ST["screening status"]
-    COND["condition"] --> DR["retrieve diet passages for the condition"] --> PCM["chat model: JSON plan"] --> VAL["validate + retry"]
-    VAL --> MK["keep valid markers"] --> RES["resolve nutrients"] --> FE["food examples"] --> PLAN["cited diet plan"]
+flowchart TD
+    REG[/"sources.json and documents"/] --> LOAD["load_documents<br/>pages"] --> CH["chunk_pages<br/>with overlap"] --> EMB["embed"] --> IDX[("index folder<br/>chunks, vectors, manifest")]
+    CSV[/"FoodData Central CSV"/] --> UPS["load_fdc<br/>idempotent upsert"] --> FS[("food store<br/>foods.sqlite")]
+    SYM[/"symptom text"/] --> CLEAN["clean_input"] --> RF{"red flag?"}
+    RF -- "yes" --> URG{{"HUMAN<br/>status urgent: contact emergency services"}}
+    RF -- "no" --> SR["retrieve disease passages"] --> SCM["chat model: JSON label"] --> LP["parse_condition_label"] --> ST[/"screening status"/]
+    ST -. "possible_condition" .-> COND[/"condition<br/>or the user selects one"/]
+    COND --> DR["retrieve diet passages<br/>for the condition"] --> PCM["chat model: JSON plan"] --> VAL["validate and retry"]
+    VAL --> MK["valid_markers"] --> RES["resolve_nutrient"] --> FE["top_foods"] --> PLAN[/"cited diet plan"/]
     IDX --> SR
     IDX --> DR
+    IDX --> QR
     FS --> RES
-    Q["follow-up question"] --> SC{"in scope?"} -->|"yes"| QR["retrieve with condition + last question"] --> ANS["cited answer"]
-    ANS --> SS["session store"]
+    Q[/"follow-up question"/] --> SC{"red flag or<br/>out of scope?"}
+    SC -- "no" --> QR["retrieve with condition<br/>and last question"] --> ANS[/"cited answer"/]
+    ANS --> SS[("session store<br/>sessions.sqlite")]
+    PLAN --> SS
+    PLAN --> REVIEW{{"HUMAN<br/>clinician or dietitian reviews every diet change"}}
+    ANS --> REVIEW
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class URG,REVIEW human
 ```
 
 ### 4.2 The life cycle of one request
+
+```mermaid
+stateDiagram-v2
+    state "Condition selected" as Selected
+    state "Diet hits retrieved" as Retrieved
+    state "JSON reply validated" as Validated
+    state "Markers checked" as Marked
+    state "Food examples added" as Foods
+    state "Plan shown" as Shown
+    state "Saved in the session" as Saved
+    state "Clinician review" as Review
+    [*] --> Selected: nutribuddy plan heart or POST /api/plan
+    Selected --> ValueError: unknown condition
+    Selected --> Retrieved: SearchIndex.search, kind diet_plan
+    Retrieved --> PlanUnavailable: no hit passes the evidence check
+    Retrieved --> Validated: complete_structured
+    Retrieved --> PlanUnavailable: refusal or no valid reply after all attempts
+    Validated --> Marked: valid_markers
+    Marked --> Foods: resolve_nutrient, top_foods
+    Foods --> Shown: plan_to_text or JSON
+    Foods --> Saved: session id given
+    Saved --> Shown
+    Shown --> Review
+    Review --> [*]
+    ValueError --> [*]
+    PlanUnavailable --> [*]
+```
 
 1. The user selects the condition `heart` on the web page or with `nutribuddy plan heart`.
 2. The service makes the query "diet for Heart disease: foods and nutrients to include, foods to limit or avoid".
@@ -234,11 +348,70 @@ flowchart TB
 8. The planner removes foods that match the foods to avoid or the `NEVER_SUGGEST` list.
 9. The output shows the summary, the food examples, the foods to avoid, the sources and the disclaimer.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant WEB as Web page
+    participant API as FastAPI app
+    participant SVC as NutriBuddy
+    participant SES as SessionStore
+    participant IDX as SearchIndex
+    participant CM as Chat model
+    participant FS as Food store
+
+    U->>WEB: select heart, click Get a diet plan
+    WEB->>API: POST /api/session with condition
+    API->>SVC: new_session(heart)
+    SVC->>SES: create, secrets.token_urlsafe
+    API-->>WEB: session_id
+    WEB->>API: POST /api/plan with condition and session_id
+    API->>SVC: plan(heart, session_id)
+    SVC->>IDX: search, kind diet_plan, condition heart
+    IDX-->>SVC: top_k hits after the evidence check and the reranker
+    SVC->>CM: complete_structured with PLAN_SYSTEM and passages
+    CM-->>SVC: JSON plan reply
+    SVC->>SVC: valid_markers
+    SVC->>FS: resolve_nutrient and top_foods, bound parameters
+    FS-->>SVC: food examples per 100 g
+    SVC->>SES: set_condition and append the plan summary
+    API-->>WEB: plan JSON and text
+    WEB-->>U: textContent of the plan
+    U->>WEB: type a question, click Ask
+    WEB->>API: POST /api/ask with session_id and question
+    API->>SVC: ask(session_id, question)
+    SVC->>SVC: clean_input, red_flags, in_scope
+    SVC->>SES: condition and history
+    SVC->>IDX: search with question, condition and last question
+    SVC->>CM: complete with ANSWER_SYSTEM
+    CM-->>SVC: plain text with markers
+    SVC->>SES: append the question and the answer
+    API-->>WEB: status, text, sources
+    WEB-->>U: textContent of the answer
+```
+
 ---
 
 ## 5. Ingestion and the index
 
 **Purpose.** Make every registered source searchable, with a citation for each chunk.
+
+```mermaid
+flowchart LR
+    REG[/"data/sources.json"/] --> LR{"load_registry<br/>valid and unique ids?"}
+    LR -- "no" --> SE[/"SourceError"/]
+    LR -- "yes" --> RP["read_pages<br/>.md, .txt by form feed, .pdf with pypdf"]
+    RP --> CT["clean_text<br/>join line-end hyphens"]
+    CT --> SS["split_sections<br/>at Markdown headings"]
+    SS --> WIN["window<br/>NUTRIBUDDY_CHUNK_WORDS,<br/>NUTRIBUDDY_CHUNK_OVERLAP"]
+    WIN --> EMB["embedder.embed<br/>hashing or sentence-transformers"]
+    EMB --> SAVE["SearchIndex.save<br/>with the fingerprint"]
+    SAVE --> OUT[("index folder<br/>chunks.json, vectors.npy, manifest.json")]
+    REG --> UF["unregistered_files<br/>under disease/ and diet_plan/"]
+    UF --> WARN[/"Warning for each<br/>file not indexed"/]
+```
 
 | Input | Output |
 |---|---|
@@ -261,6 +434,67 @@ flowchart TB
 - The index load fails if the embedder name, the index format or the fingerprint is different. Build the index again.
 - A load of the same CSV files two times gives the same row counts.
 
+The diagram shows how `load_fdc` fills the food store from one release folder.
+
+```mermaid
+flowchart TD
+    DIR[/"--fdc-dir"/] --> FD{"nutrient.csv in the folder<br/>or in sub-folders?"}
+    FD -- "no" --> FNF[/"FileNotFoundError"/]
+    FD -- "yes" --> COLS{"Required columns<br/>in each CSV?"}
+    COLS -- "no" --> FDE[/"FoodDataError"/]
+    COLS -- "yes" --> N["nutrient.csv<br/>upsert id, name, unit"]
+    N --> F["food.csv<br/>upsert fdc_id, description"]
+    F --> A["food_nutrient.csv"]
+    A --> CHK{"Number valid, amount 0 or more,<br/>food and nutrient known?"}
+    CHK -- "no" --> SKIP["skipped_rows + 1"]
+    CHK -- "yes" --> UP["INSERT ON CONFLICT DO UPDATE<br/>bound parameters"]
+    UP --> DB[("foods.sqlite")]
+    SKIP --> REP[/"LoadReport: nutrients, foods,<br/>amounts, skipped_rows"/]
+    DB --> REP
+```
+
+```mermaid
+erDiagram
+    nutrient ||--o{ food_nutrient : "nutrient_id"
+    food ||--o{ food_nutrient : "fdc_id"
+    nutrient {
+        INTEGER id PK
+        TEXT name
+        TEXT unit
+    }
+    food {
+        INTEGER fdc_id PK
+        TEXT description
+        TEXT data_type
+    }
+    food_nutrient {
+        INTEGER fdc_id FK
+        INTEGER nutrient_id FK
+        REAL amount "per 100 g, 0 or more"
+    }
+```
+
+The diagram shows the stages of `SearchIndex.search`.
+
+```mermaid
+flowchart TD
+    Q[/"query, k, kind, condition,<br/>min_score, reranker"/] --> FIL["Filter chunks<br/>by kind and condition"]
+    FIL --> TOK{"Query tokens and<br/>chunks left?"}
+    TOK -- "no" --> EMPTY[/"No hits"/]
+    TOK -- "yes" --> SC["Dense cosine and<br/>BM25 score for each chunk"]
+    SC --> EV{"Evidence check:<br/>BM25 above 0 and cosine at least min_score?"}
+    EV -- "no candidate" --> EMPTY
+    EV -- "candidates" --> RRF["Reciprocal-rank fusion<br/>RRF_K = 60"]
+    RRF --> POOL["Keep the 3 x k best fused hits"]
+    POOL --> RR{"Reranker"}
+    RR -- "coverage" --> COV["0.5 x query-token coverage<br/>+ 0.5 x fused score"]
+    RR -- "cross-encoder" --> CE["CrossEncoder score"]
+    RR -- "none" --> NO["Fused score"]
+    COV --> TOP[/"First k hits"/]
+    CE --> TOP
+    NO --> TOP
+```
+
 | Search stage | What it does |
 |---|---|
 | Filter | Keep chunks of the requested kind and condition |
@@ -278,6 +512,24 @@ flowchart TB
 |---|---|
 | A symptom text (max `NUTRIBUDDY_MAX_INPUT_CHARS` characters) | A status, a condition or none, a message and the cited `disease` passages |
 
+```mermaid
+flowchart TD
+    IN[/"symptom text"/] --> CL{"clean_input<br/>valid text?"}
+    CL -- "no" --> IE[/"InputError"/]
+    CL -- "yes" --> RF{"red_flags?"}
+    RF -- "yes" --> URG[/"urgent<br/>URGENT_MESSAGE, no search"/]
+    RF -- "no" --> SR["SearchIndex.search<br/>kind disease"]
+    SR --> HIT{"Any hit?"}
+    HIT -- "no" --> NM[/"no_match"/]
+    HIT -- "yes" --> CS["complete_structured<br/>screen_messages, ScreenReply"]
+    CS -- "ModelRefusal" --> NM
+    CS -- "StructuredOutputError" --> UP[/"unparsed"/]
+    CS -- "valid reply" --> PL{"parse_condition_label"}
+    PL -- "not valid" --> UP
+    PL -- "none" --> NM
+    PL -- "one condition" --> PC[/"possible_condition<br/>This is not a diagnosis"/]
+```
+
 **Procedure**
 
 1. Clean the text: normalize Unicode, remove control characters and check the length.
@@ -290,6 +542,22 @@ flowchart TB
 **Rules**
 
 - The offline model gives a rank-weighted vote of the conditions of the passages: passage `n` gets the weight `1/n`.
+
+The diagram shows how `parse_condition_label` reads the label in a reply.
+
+```mermaid
+flowchart LR
+    T[/"label text"/] --> E{"Empty or None?"}
+    E -- "yes" --> NV[/"not valid"/]
+    E -- "no" --> N["normalize_label_text<br/>lower case, no marks or punctuation"]
+    N --> SYN["Look for the _SYNONYMS<br/>of each condition"]
+    SYN --> C{"Number of<br/>conditions found"}
+    C -- "1" --> ONE[/"valid, that condition"/]
+    C -- "2 or 3" --> NV
+    C -- "0" --> NW{"A none word?"}
+    NW -- "yes" --> NONE[/"valid, none"/]
+    NW -- "no" --> NV
+```
 - The evaluation compares the screening with a keyword baseline and a majority baseline (see [12](#12-validation-results)).
 
 ---
@@ -303,6 +571,29 @@ flowchart TB
 | A condition (`diabetes`, `heart` or `thyroid`) | `DietPlan`: summary, nutrients, food examples, foods to avoid, sources, warnings |
 | A session id and a question | `Answer`: status, text with markers, source list |
 
+```mermaid
+flowchart TD
+    IN[/"condition and optional session id"/] --> CU{"condition_from_user<br/>diabetes, heart or thyroid?"}
+    CU -- "no" --> VE[/"ValueError"/]
+    CU -- "yes" --> Q["query_for<br/>diet for the condition"]
+    Q --> SR["SearchIndex.search<br/>kind diet_plan, the condition"]
+    SR --> H{"Any hit?"}
+    H -- "no" --> PU[/"PlanUnavailable"/]
+    H -- "yes" --> CS["complete_structured<br/>plan_messages, DietPlanReply"]
+    CS -- "refusal or no valid reply" --> PU
+    CS -- "valid reply" --> VM["valid_markers<br/>on the summary"]
+    VM --> W{"Valid marker<br/>in the summary?"}
+    W -- "no" --> WARN["Add a warning"]
+    W -- "yes" --> NUT
+    WARN --> NUT["For each nutrient:<br/>resolve_nutrient, top_foods"]
+    NUT --> UN{"Unresolved names?"}
+    UN -- "yes" --> WARN2["Add a warning<br/>with the names"]
+    UN -- "no" --> DP
+    WARN2 --> DP[/"DietPlan"/]
+    DP --> SID{"Session id given?"}
+    SID -- "yes" --> SAVE[("Session store:<br/>condition and plan summary")]
+```
+
 **Procedure (diet plan)**
 
 1. Retrieve `diet_plan` hits for the condition.
@@ -311,6 +602,25 @@ flowchart TB
 4. Keep the valid markers. If the summary has no valid marker, add a warning.
 5. Resolve each nutrient. Get `NUTRIBUDDY_FOODS_PER_NUTRIENT` food examples for each resolved nutrient.
 6. If the session id is given, save the condition and the plan summary in the session.
+
+The diagram shows how the food store gives the food examples for one nutrient name from the chat model.
+
+```mermaid
+flowchart LR
+    NM[/"nutrient name<br/>from the reply"/] --> NO["_norm<br/>lower case, plural to singular alias"]
+    NO --> L{"Empty or<br/>over 60 characters?"}
+    L -- "yes" --> UNR[/"unresolved"/]
+    L -- "no" --> AL{"In ALIASES and<br/>in the nutrient table?"}
+    AL -- "yes" --> NUT["Nutrient row"]
+    AL -- "no" --> EXA{"Exact name match?"}
+    EXA -- "yes" --> NUT
+    EXA -- "no" --> LIKE{"Prefix match<br/>LIKE with escaped wildcards?"}
+    LIKE -- "yes" --> NUT
+    LIKE -- "no" --> UNR
+    NUT --> TOP["top_foods<br/>highest amount per 100 g"]
+    TOP --> EXC["Skip foods_to_avoid<br/>and NEVER_SUGGEST words"]
+    EXC --> OUT[/"NUTRIBUDDY_FOODS_PER_NUTRIENT<br/>food examples"/]
+```
 
 **Procedure (follow-up question)**
 
@@ -321,20 +631,78 @@ flowchart TB
 5. If no valid marker is left, return `no_evidence` with "The sources do not answer this question."
 6. Save the question and the answer as two turns.
 
+```mermaid
+flowchart TD
+    IN[/"session id and question"/] --> CL{"clean_input<br/>valid text?"}
+    CL -- "no" --> IE[/"InputError"/]
+    CL -- "yes" --> RF{"red_flags?"}
+    RF -- "yes" --> URG[/"urgent"/]
+    RF -- "no" --> SC{"in_scope?"}
+    SC -- "no" --> OOS[/"out_of_scope"/]
+    SC -- "yes" --> SES["SessionStore: condition and the last<br/>NUTRIBUDDY_MAX_HISTORY_TURNS turns"]
+    SES --> RET["_retrieve_for_question<br/>question + condition + last user question"]
+    RET --> H{"Any hit?"}
+    H -- "no" --> NE[/"no_evidence"/]
+    H -- "yes" --> CM["model.complete<br/>answer_messages"]
+    CM -- "LLMError" --> ME[/"model_error<br/>not saved"/]
+    CM -- "reply" --> VM{"valid_markers left and<br/>not the no-answer text?"}
+    VM -- "no" --> NE
+    VM -- "yes" --> ANS[/"answered<br/>text and source list"/]
+    NE --> SAVE[("Append the question and<br/>the answer as two turns")]
+    ANS --> SAVE
+```
+
 **Rules**
 
 - The session store keeps the last 40 turns of a session. The prompt gets the last `NUTRIBUDDY_MAX_HISTORY_TURNS` turns.
 - The session id is a random 24-character value from `secrets.token_urlsafe`.
 
+```mermaid
+erDiagram
+    session ||--o{ turn : "session_id, ON DELETE CASCADE"
+    session {
+        TEXT id PK "secrets.token_urlsafe(18)"
+        TEXT condition "diabetes, heart, thyroid or NULL"
+        REAL created
+    }
+    turn {
+        TEXT session_id FK
+        INTEGER seq "with session_id, the primary key"
+        TEXT role "user or assistant"
+        TEXT content
+    }
+```
+
 ---
 
 ## 8. The safety model and the decision rules
+
+The diagram shows where each safety rule acts on the path of one request.
+
+```mermaid
+flowchart LR
+    U[/"User text"/] --> CI["clean_input<br/>NFKC, no control characters, length"]
+    CI --> RF{"red_flags"}
+    RF -- "found" --> URG{{"HUMAN<br/>urgent: emergency services or a clinician"}}
+    RF -- "none" --> SC["in_scope<br/>diet word check, questions only"]
+    SC --> EV["Evidence check<br/>in SearchIndex.search"]
+    EV --> PR["Prompts: passages are data,<br/>text in triple angle brackets"]
+    PR --> CS["complete_structured<br/>bounded retries"]
+    CS --> VM["valid_markers<br/>1 to the number of passages"]
+    VM --> SQL["resolve_nutrient<br/>bound parameters only"]
+    SQL --> NS["NEVER_SUGGEST and<br/>foods_to_avoid filter"]
+    NS --> OUT["to_html escape<br/>or textContent on the page"]
+    OUT --> REV{{"HUMAN<br/>clinician or dietitian review"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class URG,REV human
+```
 
 | Rule | Value | Code |
 |---|---|---|
 | Input length | 1 to `NUTRIBUDDY_MAX_INPUT_CHARS` characters (default 600), at least one letter | `safety.clean_input` |
 | Allowed characters | All printable characters. Digits, commas and apostrophes are allowed | `safety.clean_input` |
-| Red flags | chest pain, breathing difficulty, fainting, stroke signs, confusion, blood sugar over 300 or under 60, vomiting blood, self-harm | `safety.RED_FLAGS` |
+| Red flags | chest pain, breathing difficulty, fainting, stroke signs, confusion, blood sugar of 300 or more or from 10 to 59, vomiting blood, self-harm | `safety.RED_FLAGS` |
 | Scope | The question must contain a diet, food, nutrient or condition word | `safety.in_scope` |
 | Evidence check | Shared token and cosine ≥ `NUTRIBUDDY_MIN_SCORE` (default 0.05) | `index.SearchIndex.search` |
 | Retries | At most `NUTRIBUDDY_LLM_MAX_ATTEMPTS` (default 3). A refusal stops the retries | `schemas.complete_structured` |
@@ -345,7 +713,7 @@ flowchart TB
 |---|---|
 | `urgent` | The text has a red flag. The message tells the user to contact emergency services or a clinician |
 | `possible_condition` | The sources connect the symptoms with one condition. This is not a diagnosis |
-| `no_match` | No hit passed the evidence check, or the chat model said none |
+| `no_match` | No hit passed the evidence check, or the chat model said none or refused |
 | `unparsed` | The reply was not valid after all retries, or it named more than one condition |
 
 | Answer status | Meaning |
@@ -421,6 +789,27 @@ nutribuddy serve --port 8000
 
 `nutribuddy synth --out data/synthetic` writes the synthetic data only. Add `--json` to `screen`, `plan` and `ask` for JSON output.
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> SYN["nutribuddy synth"]
+    SYN --> DATA[("data/: sources.json, documents,<br/>food_data/, eval/")]
+    DATA --> LF["nutribuddy load-foods"]
+    DATA --> IX["nutribuddy index"]
+    LF --> FS[("foods.sqlite")]
+    IX --> IDX[("index/")]
+    FS --> USE["screen, plan, session, ask"]
+    IDX --> USE
+    USE --> SES[("sessions.sqlite")]
+    FS --> EV["nutribuddy eval"]
+    IDX --> EV
+    EV --> REP[/"report JSON"/]
+    FS --> SRV["nutribuddy serve<br/>extra api"]
+    IDX --> SRV
+    INS --> DEMO["nutribuddy demo<br/>synth, load-foods, index, screen,<br/>plan, ask in .nutribuddy/demo/"]
+```
+
 ### 10.4 Environment variables
 
 | Variable | Used by | Meaning |
@@ -444,7 +833,20 @@ nutribuddy serve --port 8000
 | `NUTRIBUDDY_MAX_HISTORY_TURNS` | Follow-up answers | Turns in the prompt. Default 6 |
 | `NUTRIBUDDY_FOODS_PER_NUTRIENT` | Planner | Food examples for each nutrient. Default 3 |
 
-Credentials are only in a local `.env` file. Git ignores this file. Do not print or commit credentials.
+Credentials are only in a local `.env` file. Git ignores this file. Do not print or commit credentials. nutribuddy reads environment variables only. It does not read the `.env` file: load it in your shell before you run a command.
+
+```mermaid
+flowchart LR
+    ENV[/"Process environment<br/>NUTRIBUDDY_* variables"/] --> FE["Settings.from_env<br/>empty value = default"]
+    FE --> CH{"Known embedder, reranker<br/>and provider?"}
+    CH -- "no" --> ERR[/"ConfigError: the CLI prints<br/>error: and returns 2"/]
+    CH -- "yes" --> RG{"Numbers in range,<br/>overlap below chunk words?"}
+    RG -- "no" --> ERR
+    RG -- "yes" --> SET[/"Settings"/]
+    ARGS[/"--data-dir, --work-dir"/] --> WD["with_dirs"]
+    SET --> WD
+    WD --> FS["NutriBuddy.from_settings<br/>embedder, index, chat model, stores"]
+```
 
 ---
 
@@ -464,6 +866,21 @@ Credentials are only in a local `.env` file. Git ignores this file. Do not print
 ---
 
 ## 12. Validation results
+
+`nutribuddy eval` runs `evaluation.run_all`. The diagram shows its parts.
+
+```mermaid
+flowchart LR
+    ED[/"data/eval/"/] --> R{"retrieval.jsonl<br/>exists?"}
+    R -- "yes" --> RET["evaluate_retrieval<br/>recall@k, MRR"]
+    ED --> S{"screening.jsonl<br/>exists?"}
+    S -- "yes" --> SCR["evaluate_screening<br/>nutribuddy, keyword baseline,<br/>majority baseline"]
+    SCR --> CM["classification_metrics<br/>accuracy, Wilson 95 % CI, macro-F1"]
+    PL["evaluate_plans<br/>each condition"] --> REP
+    SAF["evaluate_safety<br/>red flags, benign, injection,<br/>food store unchanged"] --> REP
+    RET --> REP[/"report JSON<br/>--out file"/]
+    CM --> REP
+```
 
 | Validation | Result | Command |
 |---|---|---|
